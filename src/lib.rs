@@ -40,7 +40,7 @@
 //!
 //! - `ROTARY_DEBOUNCE_TICKS` – consecutive identical readings required to
 //!   settle a pin state. Recommended: 3–5.
-//! - `ROTARY_LONG_PRESS_TICKS` – number of `update` ticks the button must be
+//! - `long_press_tick` – number of `update` ticks the button must be
 //!   held before [`InputEvent::SelectHold`] is generated. At a 1 ms `update`
 //!   period, set this to `500` for a 500 ms long-press threshold.
 //!
@@ -48,10 +48,11 @@
 //!
 //! Enable the `invert_rotation` Cargo feature to swap `Up`/`Down` if the
 //! encoder feels reversed, without changing hardware wiring.
-use crate::constants::tick_time::{ROTARY_DEBOUNCE_TICKS, ROTARY_LONG_PRESS_TICKS};
-use crate::{ROTARY_RESET_TIME_MILLIS, ROTATE_MULTI_COUNTER};
+//!
+
+mod types;
 use embedded_hal::digital::InputPin;
-use general_core::{InputEvent, InputSource, RotaryAccumulatorMode};
+use types::{InputEvent, InputSource, RotaryAccumulatorMode};
 // ============================================================================
 // Internal: integrating debounce filter
 // ============================================================================
@@ -73,9 +74,19 @@ struct Button {
 
     /// The settled, glitch-free pressed state.
     is_pressed: bool,
+
+    /// Debounce Tick
+    button_debounce_tick: u8,
 }
 
 impl Button {
+    pub fn new(button_debounce_tick: u8) -> Self {
+        Self {
+            counter: 0,
+            is_pressed: false,
+            button_debounce_tick,
+        }
+    }
     /// Advance the debounce filter with one raw pin sample.
     ///
     /// Call every timer ISR tick_idle, inside [`RotaryEncoder::update`].
@@ -86,7 +97,10 @@ impl Button {
     fn update(&mut self, pin_is_low: bool) {
         if pin_is_low {
             // Integrate towards "pressed", saturate at the threshold.
-            self.counter = self.counter.saturating_add(1).min(ROTARY_DEBOUNCE_TICKS);
+            self.counter = self
+                .counter
+                .saturating_add(1)
+                .min(self.button_debounce_tick);
         } else {
             // Integrate towards "released".
             self.counter = self.counter.saturating_sub(2);
@@ -94,7 +108,7 @@ impl Button {
 
         // Only latch a state change when the counter reaches an extreme,
         // ensuring the signal has been stable for ROTARY_DEBOUNCE_TICKS ticks.
-        if self.counter >= ROTARY_DEBOUNCE_TICKS {
+        if self.counter >= self.button_debounce_tick {
             self.is_pressed = true;
         } else if self.counter == 0 {
             self.is_pressed = false;
@@ -179,6 +193,12 @@ where
     /// High-level press/hold/release state machine driven by `button`.
     button_state: ButtonState,
 
+    /// A flag for state managing of hold event
+    hold_generated: bool,
+
+    /// Long press ticks
+    long_press_threshold_tick: u16,
+
     /// Last sampled quadrature state (2 bits: CLK_low << 1 | DT_low).
     last_quad_state: u8,
 
@@ -186,14 +206,21 @@ where
     /// Positive = clockwise, negative = counter-clockwise.
     encoder_accumulator: i8,
 
-    /// A flag for state managing of hold event
-    hold_generated: bool,
-
-    rotate_counter: u8,
-
+    /// An accumulator for saving rotation direction independent of rotary model. clockwise is + and
+    /// anti-clockwise is -
     last_accumulator: RotaryAccumulatorMode,
 
+    /// A counter for resetting the rotary when there is no change in input pins
     reset_counter: u8,
+
+    /// Reset time for fast moving up or down
+    rotary_reset_time_threshold_ms: u16,
+
+    /// A counter for rotation steps
+    rotate_counter: u8,
+
+    /// A counter for dedicating when the rotary is going to fast mode rotating
+    rotary_multi_step_threshold: u8
 }
 
 impl<CLK, DT, SW> RotaryEncoder<CLK, DT, SW>
@@ -211,7 +238,15 @@ where
     /// - `clk_pin`: CLK / phase-A input.
     /// - `dt_pin`:  DT  / phase-B input.
     /// - `sw_pin`:  SW  / switch input (active LOW, external pull-up assumed).
-    pub fn new(mut clk_pin: CLK, mut dt_pin: DT, sw_pin: SW) -> Self {
+    pub fn new(
+        mut clk_pin: CLK,
+        mut dt_pin: DT,
+        sw_pin: SW,
+        button_debounce_tick: u8,
+        long_press_tick: u16,
+        rotary_reset_time_ms: u16,
+        rotary_multi_step_threshold: u8
+    ) -> Self {
         let clk_low = clk_pin.is_low().unwrap_or(false);
         let dt_low = dt_pin.is_low().unwrap_or(false);
         let initial_state = (clk_low as u8) << 1 | (dt_low as u8);
@@ -220,7 +255,8 @@ where
             clk_pin,
             dt_pin,
             sw_pin,
-            button: Button::default(),
+            long_press_threshold_tick: long_press_tick,
+            button: Button::new(button_debounce_tick),
             button_state: ButtonState::Idle,
             last_quad_state: initial_state,
             encoder_accumulator: 0,
@@ -228,6 +264,8 @@ where
             rotate_counter: 0,
             last_accumulator: RotaryAccumulatorMode::None,
             reset_counter: 0,
+            rotary_reset_time_threshold_ms: rotary_reset_time_ms,
+            rotary_multi_step_threshold
         }
     }
 
@@ -261,7 +299,7 @@ where
 
             ButtonState::Counting(ticks) => {
                 if self.button.is_pressed {
-                    if ticks >= ROTARY_LONG_PRESS_TICKS {
+                    if ticks >= self.long_press_threshold_tick {
                         // Hold threshold crossed — poll() will emit SelectHold.
                         // Move to WaitingRelease to block any further events
                         // until the button is physically released.
@@ -359,13 +397,13 @@ where
             }
             self.last_accumulator = RotaryAccumulatorMode::Positive;
             return if cfg!(feature = "invert_rotation") {
-                if self.rotate_counter > ROTATE_MULTI_COUNTER {
+                if self.rotate_counter > self.rotary_multi_step_threshold {
                     InputEvent::FastDown
                 } else {
                     InputEvent::Down
                 }
             } else {
-                if self.rotate_counter > ROTATE_MULTI_COUNTER {
+                if self.rotate_counter > self.rotary_multi_step_threshold {
                     InputEvent::FastUp
                 } else {
                     InputEvent::Up
@@ -382,13 +420,13 @@ where
             }
             self.last_accumulator = RotaryAccumulatorMode::Negative;
             return if cfg!(feature = "invert_rotation") {
-                if self.rotate_counter >= ROTATE_MULTI_COUNTER {
+                if self.rotate_counter >= self.rotary_multi_step_threshold {
                     InputEvent::FastUp
                 } else {
                     InputEvent::Up
                 }
             } else {
-                if self.rotate_counter >= ROTATE_MULTI_COUNTER {
+                if self.rotate_counter >= self.rotary_multi_step_threshold {
                     InputEvent::FastDown
                 } else {
                     InputEvent::Down
@@ -419,7 +457,7 @@ where
             return InputEvent::Select;
         }
         self.reset_counter += 1;
-        if self.reset_counter > ROTARY_RESET_TIME_MILLIS as u8 {
+        if self.reset_counter > self.rotary_reset_time_threshold_ms as u8 {
             self.reset_counter = 0;
             self.last_accumulator = RotaryAccumulatorMode::None;
             self.rotate_counter = 0;
