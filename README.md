@@ -1,191 +1,230 @@
 # Rotary_Library
 
-A `no_std`, interrupt-safe Rust driver for **quadrature rotary encoders** with an integrated push-button switch. Built on top of [`embedded-hal 1.0`](https://docs.rs/embedded-hal/1.0.0/embedded_hal/), designed for STM32 and other ARM Cortex-M targets.
+A `no_std`, interrupt-safe driver for **quadrature rotary encoders** with an integrated push-button.
+
+Built on top of `embedded-hal 1.0`, designed for deterministic behavior in bare-metal embedded systems (e.g. STM32).
 
 ---
 
-## Features
+## Overview
 
-- `no_std` compatible — no heap allocation
-- Hardware-agnostic via `embedded-hal` `InputPin` trait
-- Two-stage ISR / polling split for interrupt-safe use
-- Integrating debounce filter on the push-button (glitch rejection)
-- Full quadrature decoding with a 4×4 transition table
-- Short press (`Select`) and long press (`SelectHold`) events
-- Fast-rotation events (`FastUp` / `FastDown`) via consecutive-tick accumulator
-- `invert_rotation` Cargo feature to reverse direction without rewiring
+This driver follows a **two-stage design**:
 
----
+- `update()` → fast, deterministic, ISR-safe
+- `poll()`   → slower, user-facing event decoding
 
-## Architecture: Two-Stage Design
-
-The driver splits responsibility cleanly across two calling contexts:
-
-| Method   | Where to call                | Typical period | What it does                                      |
-|----------|------------------------------|----------------|---------------------------------------------------|
-| `update` | Periodic timer ISR           | 1–2 ms         | Samples pins, runs debounce, accumulates steps    |
-| `poll`   | Main loop / UI task          | 10–50 ms       | Decodes accumulated state → returns `InputEvent`  |
-
-`update` must be called **faster** than `poll` so that debouncing settles before events are consumed and no quadrature edges are missed.
+This separation ensures:
+- No missed quadrature edges
+- Stable debounce behavior
+- Minimal ISR workload
 
 ---
 
-## Struct Fields & Configuration
+## Architecture
 
-`RotaryEncoder` owns all runtime state. The values that control timing behaviour are passed at construction and stored inside the struct — no external constants file needed.
+| Method   | Context            | Typical Rate | Responsibility                         |
+|----------|--------------------|--------------|----------------------------------------|
+| `update` | Timer ISR          | 1–2 ms       | Sample pins, debounce, accumulate data |
+| `poll`   | Main loop / task   | 10–50 ms     | Convert state → `InputEvent`           |
+
+> `update()` must run faster than `poll()`.
+
+---
+
+## RotaryEncoder Structure
+
+The driver stores all runtime state internally. Timing and behavior are controlled through these fields:
 
 ```rust
-pub struct RotaryEncoder<CLK, DT, SW> {
-    clk_pin: CLK,   // CLK / phase-A input pin
-    dt_pin:  DT,    // DT  / phase-B input pin
-    sw_pin:  SW,    // SW  / switch input pin (active LOW, pull-up)
+pub struct RotaryEncoder<CLK, DT, SW>
+where
+    CLK: InputPin,
+    DT: InputPin,
+    SW: InputPin,
+{
+    // ── Hardware pins ────────────────────────────────────────────────────
+    clk_pin: CLK,
+    dt_pin:  DT,
+    sw_pin:  SW,
 
-    // ── Debounce ──────────────────────────────────────────────────────────
-    // Integrating filter counter.
-    // Increments toward ROTARY_DEBOUNCE_TICKS when the pin is LOW (pressed),
-    // decrements by 2 when HIGH (released).
-    // `is_pressed` only latches when the counter reaches either extreme,
-    // rejecting glitches shorter than ROTARY_DEBOUNCE_TICKS ticks.
+    // ── Button debounce (integrating filter) ─────────────────────────────
+    // Counter moves toward:
+    //   - MAX when pressed (LOW)
+    //   - 0   when released (HIGH)
+    //
+    // Only when the counter saturates do we accept a stable state.
+    // This rejects short glitches.
+    //
+    // Equivalent concept to:
+    //   "debounce window length" = ROTARY_DEBOUNCE_TICKS
     button: Button,
-    // ROTARY_DEBOUNCE_TICKS — number of consecutive identical
-    // readings required to settle the button state. Recommended: 3–5.
 
-    // ── Button press / hold state machine ────────────────────────────────
-    // Advances through Idle → Counting(n) → WaitingRelease → Idle.
-    // The sentinel Counting(u16::MAX) signals a short press (released
-    // before the hold threshold).
+    // ── Button state machine ─────────────────────────────────────────────
+    //
+    // Idle → Counting → WaitingRelease → Idle
+    //
+    // - Counts how long button is held
+    // - Detects short vs long press
+    //
+    // Long press threshold:
+    //   ROTARY_LONG_PRESS_TICKS (in update ticks)
+    //
     button_state: ButtonState,
-    // ROTARY_LONG_PRESS_TICKS — number of `update` ticks the button must
-    // be continuously held before `InputEvent::SelectHold` is emitted.
-    // Example: at a 1 ms update period, set 500 for a 500 ms long-press.
 
-    // ── Quadrature accumulator ────────────────────────────────────────────
-    // Running step count since the last `poll`. +1 per CW edge, -1 per CCW.
-    // When |accumulator| reaches STEPS_PER_CLICK (= 4), one logical click
-    // is reported and the accumulator resets.
+    // ── Quadrature decoding ──────────────────────────────────────────────
+    //
+    // Accumulates +1 / -1 per valid transition.
+    // One full detent = 4 steps.
+    //
     encoder_accumulator: i8,
     last_quad_state: u8,
 
-    // ── Fast-rotation tracking ────────────────────────────────────────────
-    // rotate_counter counts consecutive clicks in the same direction.
-    // When it exceeds ROTATE_MULTI_COUNTER, `poll` emits FastUp / FastDown
-    // instead of Up / Down, allowing the UI to scroll faster.
-    // The counter resets after ROTARY_RESET_TIME_MILLIS idle poll cycles
-    // or on a direction change.
-    rotate_counter:   u8,
+    // ── Fast rotation detection ──────────────────────────────────────────
+    //
+    // Counts consecutive same-direction clicks.
+    //
+    // If threshold exceeded:
+    //   → FastUp / FastDown is emitted
+    //
+    // Threshold:
+    //   ROTATE_MULTI_COUNTER
+    //
+    rotate_counter: u8,
+
+    // Last direction (for streak tracking)
     last_accumulator: RotaryAccumulatorMode,
-    reset_counter:    u8,
-    hold_generated:   bool,
+
+    // Idle timeout counter:
+    //
+    // If no movement occurs for:
+    //   ROTARY_RESET_TIME_MILLIS (poll cycles)
+    //
+    // then fast-rotation streak resets.
+    reset_counter: u8,
+
+    // Ensures SelectHold is emitted only once
+    hold_generated: bool,
 }
 ```
 
-### Configuration at a Glance
+---
 
-| Field / Constant            | Type  | What it controls                                                              |
-|-----------------------------|-------|-------------------------------------------------------------------------------|
-| `ROTARY_DEBOUNCE_TICKS`     | `u8`  | Glitch filter depth. Raise to reject more noise; lower for faster response. Recommended: **3–5**. |
-| `ROTARY_LONG_PRESS_TICKS`   | `u16` | Hold threshold in `update` ticks. At 1 ms period → `500` = 500 ms long-press. |
-| `ROTATE_MULTI_COUNTER`      | `u8`  | Consecutive same-direction clicks before fast-scroll activates.               |
-| `ROTARY_RESET_TIME_MILLIS`  | `u8`  | Idle `poll` cycles before the fast-scroll streak resets.                      |
+## Configuration Parameters (Conceptual)
+
+These are not part of the struct API but define behavior:
+
+- **Debounce window**
+  - Number of stable samples required before accepting a button state
+  - Typical: `3–5` ticks
+
+- **Long press threshold**
+  - Duration (in `update()` ticks) required to trigger `SelectHold`
+  - Example: `500` at 1 ms → 500 ms
+
+- **Fast rotation threshold**
+  - Number of consecutive same-direction clicks before switching to fast mode
+
+- **Reset timeout**
+  - Idle time before fast-rotation streak resets
 
 ---
 
 ## Button State Machine
 
 ```
-                 [press detected]
-  Idle ──────────────────────────────────────► Counting(0)
+Idle
+ └─(press)────────────► Counting(0)
 
-  Counting(n) ──[held, n < LONG_PRESS_TICKS]──► Counting(n+1)
-  Counting(n) ──[released < LONG_PRESS_TICKS]──► Counting(u16::MAX)  ← short-press sentinel
-  Counting(n) ──[n >= LONG_PRESS_TICKS]────────► WaitingRelease
+Counting(n)
+ ├─(held < threshold)─► Counting(n+1)
+ ├─(released early)───► Counting(u16::MAX) → Select
+ └─(held ≥ threshold)► WaitingRelease → SelectHold
 
-  WaitingRelease ──[poll reads, still held]────► emit SelectHold  (exactly once)
-  WaitingRelease ──[released]──────────────────► Idle             (no extra event)
-  Counting(u16::MAX) ──[poll reads]────────────► emit Select ───► Idle
+WaitingRelease
+ └─(release)─────────► Idle
 ```
 
-**Guarantees:**
-- `SelectHold` fires exactly once per long press, the moment `poll` first sees `WaitingRelease`.
-- No extra event is emitted when the button is released after a long press.
-- `Select` fires only for genuine short presses (released before the hold threshold).
+### Guarantees
+
+- `SelectHold` fires **once only**
+- No extra event on release after hold
+- `Select` only fires for short presses
 
 ---
 
-## Cargo.toml
+## Quadrature Decoding
 
-```toml
-[dependencies]
-Rotary_Library = { path = "../Rotary_Library" }
-embedded-hal = "1.0.0"
+Each pin pair is encoded into a 2-bit state:
+
+```
+state = (CLK_low << 1) | DT_low
 ```
 
-The crate also depends on `general_core` (workspace-internal) for the
-`InputEvent`, `InputSource`, and `RotaryAccumulatorMode` types.
+A 4×4 transition table determines direction:
+
+```
+prev → current
+
+00 → 01 = -1
+00 → 10 = +1
+...
+```
+
+- Invalid transitions → ignored
+- Accumulator collects steps
+- 4 steps = 1 click
 
 ---
 
-## Feature Flags
+## Fast Rotation
 
-| Feature           | Default | Effect                                                                |
-|-------------------|---------|-----------------------------------------------------------------------|
-| `invert_rotation` | off     | Swaps `Up`↔`Down` and `FastUp`↔`FastDown` without changing wiring    |
+When rotation continues in the same direction:
 
-```toml
-[features]
-invert_rotation = ["Rotary_Library/invert_rotation"]
-```
+- `rotate_counter` increments
+- After threshold → emits `FastUp` / `FastDown`
+
+Resets when:
+- Direction changes
+- Idle timeout expires
 
 ---
 
-## Usage Example (bare-metal, no RTOS)
+## Usage Example (Bare-Metal)
 
 ```rust
 #![no_std]
 #![no_main]
 
 use cortex_m_rt::entry;
-use stm32f1xx_hal::{pac, prelude::*, timer};
 use Rotary_Library::RotaryEncoder;
 use general_core::{InputEvent, InputSource};
 
 #[entry]
 fn main() -> ! {
-    let dp = pac::Peripherals::take().unwrap();
-    let cp = cortex_m::Peripherals::take().unwrap();
+    // init clocks, GPIO, etc...
 
-    let mut flash = dp.FLASH.constrain();
-    let rcc = dp.RCC.constrain();
-    let clocks = rcc.cfgr.freeze(&mut flash.acr);
+    let mut encoder = RotaryEncoder::new(clk, dt, sw);
 
-    let mut gpiob = dp.GPIOB.split();
-    let clk_pin = gpiob.pb10.into_pull_up_input(&mut gpiob.crh);
-    let dt_pin  = gpiob.pb11.into_pull_up_input(&mut gpiob.crh);
-    let sw_pin  = gpiob.pb12.into_pull_up_input(&mut gpiob.crh);
-
-    let mut encoder = RotaryEncoder::new(clk_pin, dt_pin, sw_pin);
-
-    // Simple 1 ms tick using SysTick delay
-    let mut delay = cp.SYST.delay(&clocks);
-    let mut poll_divider: u8 = 0;
+    let mut tick: u8 = 0;
 
     loop {
-        // ── 1 ms update tick ─────────────────────────────────────────────
+        // ── Fast update (~1 ms) ───────────────────────────
         encoder.update();
-        delay.delay_ms(1u16);
 
-        // ── Poll every 10 ms ─────────────────────────────────────────────
-        poll_divider = poll_divider.wrapping_add(1);
-        if poll_divider >= 10 {
-            poll_divider = 0;
+        delay_ms(1);
+
+        // ── Slower poll (~10 ms) ──────────────────────────
+        tick += 1;
+        if tick >= 10 {
+            tick = 0;
 
             match encoder.poll() {
-                InputEvent::Up         => { /* scroll up        */ }
-                InputEvent::Down       => { /* scroll down      */ }
-                InputEvent::FastUp     => { /* fast scroll up   */ }
-                InputEvent::FastDown   => { /* fast scroll down */ }
-                InputEvent::Select     => { /* short press      */ }
-                InputEvent::SelectHold => { /* long press       */ }
+                InputEvent::Up         => {}
+                InputEvent::Down       => {}
+                InputEvent::FastUp     => {}
+                InputEvent::FastDown   => {}
+                InputEvent::Select     => {}
+                InputEvent::SelectHold => {}
                 InputEvent::None       => {}
             }
         }
@@ -195,53 +234,32 @@ fn main() -> ! {
 
 ---
 
-## Internals
+## Hardware Notes
 
-### Debounce Filter
-
-A per-pin **integrating counter** advances toward `ROTARY_DEBOUNCE_TICKS` while the pin is LOW and retreats by 2 per tick while HIGH. `is_pressed` latches only when the counter saturates (pressed) or reaches zero (released). This means a glitch must be sustained for the full debounce window to change the output state.
-
-### Quadrature Decoder
-
-Both CLK and DT are packed into a 2-bit value (`CLK_low << 1 | DT_low`). The 4×4 transition table maps every `(previous, current)` pair to `+1` (CW), `-1` (CCW), or `0` (invalid):
-
-```
-             current state
-prev state  00   01   10   11
-  00      [  0,  -1,  +1,   0 ]
-  01      [ +1,   0,   0,  -1 ]
-  10      [ -1,   0,   0,  +1 ]
-  11      [  0,  +1,  -1,   0 ]
-```
-
-Steps accumulate in `encoder_accumulator`. One logical click = **4 steps**, matching the 4 quadrature edges per physical detent of most mechanical encoders.
-
-### Fast Rotation
-
-`rotate_counter` tracks consecutive same-direction clicks. Once it exceeds `ROTATE_MULTI_COUNTER`, `poll` upgrades `Up`→`FastUp` or `Down`→`FastDown`. It resets after `ROTARY_RESET_TIME_MILLIS` idle cycles or on a direction reversal, so the fast mode naturally expires when the user slows down.
+- All inputs should be **pull-up**
+- Button is **active LOW**
+- Typical encoder: 4 edges per detent → matches internal step logic
 
 ---
 
-## Hardware Wiring
+## Features
 
-| Encoder Pin | MCU Pin        | Notes                                 |
-|-------------|----------------|---------------------------------------|
-| CLK (A)     | Any GPIO input | Enable internal pull-up               |
-| DT  (B)     | Any GPIO input | Enable internal pull-up               |
-| SW          | Any GPIO input | Active LOW — enable internal pull-up  |
-| GND         | GND            |                                       |
-
-> On STM32F1 with `stm32f1xx-hal`, configure CLK, DT, and SW as `into_pull_up_input()`.
+- `no_std`
+- ISR-safe design
+- Glitch-resistant debounce
+- Deterministic behavior
+- Fast rotation detection
+- Optional `invert_rotation` feature flag
 
 ---
 
 ## License
 
-MIT License.
+MIT
 
 ---
 
 ## Author
 
-**Monib Mokhtari** — Embedded Systems Engineer  
-[GitHub: MonibMo](https://github.com/MonibMo)
+Monib Mokhtari  
+https://github.com/MonibMo
