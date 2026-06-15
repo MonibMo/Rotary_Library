@@ -1,3 +1,4 @@
+#![no_std]
 //! # Rotary Encoder Driver
 //!
 //! An interrupt-safe driver for a standard quadrature rotary encoder
@@ -7,44 +8,42 @@
 //!
 //! The driver is split into two layers:
 //!
-//! - [`RotaryEncoder::update`] is called from a fast periodic context
-//!   such as a timer interrupt.
+//! - [`RotaryEncoder::update`] is called from a fast periodic context,
+//!   typically a timer interrupt.
 //! - [`InputSource::poll`] is called from a slower UI task or main loop.
 //!
-//! The rotary part accumulates quadrature motion in `update()` and turns
-//! it into high-level events in `poll()`.
+//! The rotary part accumulates quadrature movement in `update()` and
+//! converts it into high-level events in `poll()`.
 //!
-//! The button part is now fully self-contained:
+//! The button part is fully self-contained:
 //!
-//! - The [`Button`] owns its own switch pin.
-//! - It performs raw sampling, debounce, press/hold/release tracking,
-//!   and event generation internally.
-//! - The rotary encoder simply calls `self.button.update()` and later
-//!   consumes button events through `self.button.poll()`.
+//! - [`Button`] owns its own switch pin.
+//! - It performs raw sampling, debouncing, press/hold/release tracking,
+//!   and event buffering internally.
+//! - [`RotaryEncoder`] only delegates button sampling to `self.button.update()`
+//!   and later consumes buffered button events through `self.button.poll()`.
 //!
 //! ## Typical timing
 //!
 //! - `update()` period: about 1–2 ms
 //! - `poll()` period: about 5–20 ms
 //!
-//! `update()` must run faster than `poll()` so that debounce and
-//! quadrature sampling remain reliable.
+//! `update()` should run faster than `poll()` so that debounce filtering
+//! settles correctly and short quadrature pulses are not missed.
 
 mod types;
 
 use embedded_hal::digital::InputPin;
-use types::{InputEvent, InputSource, RotaryAccumulatorMode};
-use crate::types::ButtonState;
+pub use types::{InputEvent, InputSource, RotaryAccumulatorMode,ButtonDefaultState, ButtonState};
 
-/// Required quadrature step count for one logical encoder click.
+/// Number of quadrature steps required to produce one logical rotary event.
 ///
-/// Many mechanical rotary encoders generate four valid quadrature
-/// transitions per physical detent, so `4` usually maps one detent
-/// to one UI event.
+/// Many mechanical encoders generate four valid transitions per detent,
+/// so `4` maps one physical click to one UI movement event.
 const STEPS_PER_CLICK: i8 = 4;
 
 // ============================================================================
-// Button internals
+// Button
 // ============================================================================
 
 /// Self-contained push-button handler with debounce and hold detection.
@@ -57,10 +56,10 @@ const STEPS_PER_CLICK: i8 = 4;
 /// - long press detection,
 /// - event buffering for later consumption.
 ///
-/// The switch is assumed to be **active-low**, meaning:
+/// The electrical meaning of “pressed” depends on [`ButtonDefaultState`]:
 ///
-/// - pin LOW  => pressed
-/// - pin HIGH => released
+/// - [`ButtonDefaultState::PulledUp`]   => pin LOW means pressed
+/// - [`ButtonDefaultState::PulledDown`] => pin HIGH means pressed
 ///
 /// # Timing model
 ///
@@ -69,16 +68,21 @@ const STEPS_PER_CLICK: i8 = 4;
 ///
 /// # Event behavior
 ///
-/// - A short press generates [`InputEvent::Select`] once, after release.
+/// - A short press generates [`InputEvent::Select`] once, on release.
 /// - A long press generates [`InputEvent::SelectHold`] once, when the hold
 ///   threshold is crossed.
 /// - Releasing after a long press produces no extra event.
-pub struct Button<SW>
+pub struct Button<PIN>
 where
-    SW: InputPin,
+    PIN: InputPin,
 {
-    /// Physical switch pin, active-low.
-    sw_pin: SW,
+    /// Physical switch pin.
+    pin: PIN,
+
+    /// Electrical idle configuration of the switch input.
+    ///
+    /// This determines which raw logic level is interpreted as a press.
+    button_default_state: ButtonDefaultState,
 
     /// Integration counter used for debounce filtering.
     ///
@@ -91,46 +95,61 @@ where
     /// Current debounced logical button state.
     is_pressed: bool,
 
-    /// Number of stable samples required to settle a pressed state.
+    /// Number of stable update ticks required to settle a pressed state.
     button_debounce_tick: u8,
 
-    /// Number of update ticks required to classify the press as a hold.
+    /// Number of update ticks required to classify a press as a hold.
     long_press_threshold_tick: u16,
 
     /// High-level press lifecycle state.
     state: ButtonState,
 
-    /// Buffered event produced by `update()` and consumed by `poll()`.
-    ///
-    /// Only one event is stored at a time. If no event is pending,
-    /// this field contains [`InputEvent::None`].
+    /// Buffered event produced by [`Button::update`] and consumed by
+    /// [`Button::poll`].
     pending_event: InputEvent,
 }
 
-impl<SW> Button<SW>
+impl<PIN> Button<PIN>
 where
-    SW: InputPin,
+    PIN: InputPin,
 {
     /// Creates a new button handler.
     ///
     /// # Parameters
     ///
-    /// - `sw_pin`: Active-low button input pin
-    /// - `button_debounce_tick`: Debounce threshold in update ticks
-    /// - `long_press_tick`: Hold threshold in update ticks
+    /// - `pin`: Physical button input pin
+    /// - `button_default_state`: Electrical idle configuration of the pin
+    /// - `button_debounce_tick`: Debounce threshold in update ticks, should be non-zero
+    /// - `long_press_threshold_tick`: Hold threshold in update ticks
     ///
     /// # Notes
     ///
     /// The initial debounced state starts as released.
-    pub fn new(sw_pin: SW, button_debounce_tick: u8, long_press_threshold_tick: u16) -> Self {
+    pub fn new(
+        pin: PIN,
+        button_default_state: ButtonDefaultState,
+        button_debounce_tick: u8,
+        long_press_threshold_tick: u16,
+    ) -> Self {
         Self {
-            sw_pin,
+            pin,
+            button_default_state,
             debounce_counter: 0,
             is_pressed: false,
             button_debounce_tick,
             long_press_threshold_tick,
             state: ButtonState::default(),
             pending_event: InputEvent::None,
+        }
+    }
+
+    /// Interprets the raw GPIO level as a logical “pressed” state.
+    ///
+    /// The meaning of HIGH/LOW depends on the configured button wiring.
+    fn examine_pressed(&mut self) -> bool {
+        match self.button_default_state {
+            ButtonDefaultState::PulledDown => self.pin.is_high().unwrap_or(false),
+            ButtonDefaultState::PulledUp => self.pin.is_low().unwrap_or(false),
         }
     }
 
@@ -150,7 +169,7 @@ where
     /// This method is intended for a fast periodic context, such as
     /// a timer ISR running every 1–2 ms.
     pub fn update(&mut self) {
-        let pin_is_low = self.sw_pin.is_low().unwrap_or(false);
+        let key_pressed = self.examine_pressed();
 
         // --------------------------------------------------------------------
         // 1. Debounce integrator
@@ -164,8 +183,8 @@ where
         //   toward zero.
         //
         // The debounced state only changes when the counter reaches one
-        // extreme or the other, which suppresses brief glitches.
-        if pin_is_low {
+        // extreme or the other, which suppresses short glitches.
+        if key_pressed {
             self.debounce_counter = self
                 .debounce_counter
                 .saturating_add(1)
@@ -187,14 +206,13 @@ where
         // This logic translates the debounced boolean state into high-level
         // user events:
         //
-        // - short press  => Select
-        // - long press   => SelectHold
+        // - short press => Select
+        // - long press  => SelectHold
         //
         // The event is stored into `pending_event` and later consumed by poll().
         self.state = match self.state {
             ButtonState::Idle => {
                 if self.is_pressed {
-                    // A new debounced press has started.
                     ButtonState::Counting(0)
                 } else {
                     ButtonState::Idle
@@ -213,7 +231,7 @@ where
                         ButtonState::Counting(ticks.saturating_add(1))
                     }
                 } else {
-                    // Released before crossing the hold threshold:
+                    // Released before the hold threshold was reached:
                     // this is a short press.
                     if self.pending_event == InputEvent::None {
                         self.pending_event = InputEvent::Select;
@@ -226,17 +244,20 @@ where
                 if self.is_pressed {
                     ButtonState::WaitingRelease
                 } else {
-                    // Release after a long press generates no new event.
+                    // Release after a long press generates no extra event.
                     ButtonState::Idle
                 }
             }
         };
     }
 
+    pub fn is_idle(&self) -> bool {
+        self.state == ButtonState::Idle
+    }
+
     /// Returns the next buffered button event.
     ///
-    /// This consumes any pending button event generated by
-    /// [`Button::update`].
+    /// This consumes any pending event generated by [`Button::update`].
     ///
     /// # Returns
     ///
@@ -251,8 +272,8 @@ where
 
     /// Returns the current debounced pressed state.
     ///
-    /// This can be useful for debugging or UI logic that needs direct
-    /// access to the settled button level rather than edge events.
+    /// This is useful when the caller needs the current stable button level
+    /// rather than edge-triggered events.
     pub fn is_pressed(&self) -> bool {
         self.is_pressed
     }
@@ -275,12 +296,11 @@ where
 /// The rotary encoder owns the quadrature pins directly and owns a
 /// [`Button<SW>`] instance for the switch.
 ///
-/// The button logic is completely delegated to the internal button object.
-/// This keeps responsibilities cleaner:
+/// Responsibilities are split cleanly:
 ///
 /// - [`Button`] handles switch sampling, debounce, and button events
-/// - [`RotaryEncoder`] handles quadrature decoding and combines all input
-///   sources into one [`InputEvent`] stream
+/// - [`RotaryEncoder`] handles quadrature decoding and merges all sources
+///   into one [`InputEvent`] stream
 pub struct RotaryEncoder<CLK, DT, SW>
 where
     CLK: InputPin,
@@ -305,14 +325,13 @@ where
 
     /// Accumulated quadrature delta since the last emitted rotation event.
     ///
-    /// Positive values represent one direction, negative values represent
-    /// the opposite direction.
+    /// Positive values represent one direction and negative values the other.
     encoder_accumulator: i8,
 
     /// Remembers the last movement direction for fast-rotation logic.
     last_accumulator: RotaryAccumulatorMode,
 
-    /// Counter used to reset fast-rotation streak tracking after inactivity.
+    /// Counter used to reset fast-rotation tracking after inactivity.
     reset_counter: u8,
 
     /// Inactivity threshold after which the fast-rotation streak is cleared.
@@ -337,12 +356,12 @@ where
     ///
     /// - `clk_pin`: Encoder CLK / phase-A input
     /// - `dt_pin`: Encoder DT / phase-B input
-    /// - `sw_pin`: Encoder push-button input, active-low
-    /// - `button_debounce_tick`: Debounce threshold for the button
+    /// - `sw_pin`: Encoder push-button input
+    /// - `button_default_state`: Electrical idle configuration of the button input
+    /// - `button_debounce_tick`: Debounce threshold for the button, should be non-zero
     /// - `long_press_tick`: Long-press threshold for the button
     /// - `rotary_reset_time_ms`: Idle time before fast-rotation tracking resets
-    /// - `rotary_multi_step_threshold`: Number of same-direction steps before
-    ///   generating fast rotation events
+    /// - `rotary_multi_step_threshold`: Number of same-direction steps before generating fast rotation events
     ///
     /// # Notes
     ///
@@ -352,6 +371,7 @@ where
         mut clk_pin: CLK,
         mut dt_pin: DT,
         sw_pin: SW,
+        button_default_state: ButtonDefaultState,
         button_debounce_tick: u8,
         long_press_tick: u16,
         rotary_reset_time_ms: u16,
@@ -364,7 +384,12 @@ where
         Self {
             clk_pin,
             dt_pin,
-            button: Button::new(sw_pin, button_debounce_tick, long_press_tick),
+            button: Button::new(
+                sw_pin,
+                button_default_state,
+                button_debounce_tick,
+                long_press_tick,
+            ),
             last_quad_state: initial_state,
             encoder_accumulator: 0,
             last_accumulator: RotaryAccumulatorMode::None,
@@ -394,7 +419,7 @@ where
         // 2. Decode quadrature movement
         // --------------------------------------------------------------------
         //
-        // The encoder state is represented as:
+        // The encoder state is encoded as:
         //
         //   bit 1 = CLK_low
         //   bit 0 = DT_low
@@ -404,7 +429,7 @@ where
         //
         // - +1 for one valid direction
         // - -1 for the other valid direction
-        // -  0 for invalid/noisy/no-change transitions
+        // -  0 for invalid, noisy, or unchanged transitions
         #[rustfmt::skip]
         const QUAD_TABLE: [i8; 16] = [
              0, -1,  1,  0,   // prev = 00
@@ -419,9 +444,8 @@ where
 
         if current != self.last_quad_state {
             let index = ((self.last_quad_state << 2) | current) as usize;
-            self.encoder_accumulator = self
-                .encoder_accumulator
-                .saturating_add(QUAD_TABLE[index]);
+            self.encoder_accumulator =
+                self.encoder_accumulator.saturating_add(QUAD_TABLE[index]);
             self.last_quad_state = current;
         }
     }
@@ -442,13 +466,13 @@ where
 {
     /// Returns the next high-level input event.
     ///
-    /// Priority order is:
+    /// Priority order:
     ///
     /// 1. Rotation events
     /// 2. Button events
     /// 3. No event
     ///
-    /// Rotation is prioritized so that rapid encoder movement is not delayed
+    /// Rotation is prioritized so that rapid movement is not delayed
     /// behind button handling.
     fn poll(&mut self) -> InputEvent {
         // --------------------------------------------------------------------
@@ -472,12 +496,10 @@ where
                 } else {
                     InputEvent::Down
                 }
+            } else if self.rotate_counter > self.rotary_multi_step_threshold {
+                InputEvent::FastUp
             } else {
-                if self.rotate_counter > self.rotary_multi_step_threshold {
-                    InputEvent::FastUp
-                } else {
-                    InputEvent::Up
-                }
+                InputEvent::Up
             };
         }
 
@@ -499,12 +521,10 @@ where
                 } else {
                     InputEvent::Up
                 }
+            } else if self.rotate_counter >= self.rotary_multi_step_threshold {
+                InputEvent::FastDown
             } else {
-                if self.rotate_counter >= self.rotary_multi_step_threshold {
-                    InputEvent::FastDown
-                } else {
-                    InputEvent::Down
-                }
+                InputEvent::Down
             };
         }
 
