@@ -64,3 +64,5 @@ pub enum ButtonState {
     /// SelectHold already emitted, silently waiting for physical release.
     WaitingRelease,
 }
+
+pub type MilliSeconds = u32;

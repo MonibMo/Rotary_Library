@@ -1,5 +1,5 @@
 [package]
-name = "Rotary_Library"
+name = "rotary-library"
 version = "0.1.0"
 edition = "2024"
 

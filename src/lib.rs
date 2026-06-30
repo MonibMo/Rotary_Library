@@ -1,3 +1,4 @@
+#![no_std]
 //! # Rotary Encoder Driver
 //!
 //! An interrupt-safe driver for a standard quadrature rotary encoder
@@ -32,9 +33,9 @@
 
 mod types;
 
+pub use crate::types::ButtonState;
 use embedded_hal::digital::InputPin;
-use types::{InputEvent, InputSource, RotaryAccumulatorMode};
-use crate::types::ButtonState;
+pub use types::{InputEvent, InputSource, RotaryAccumulatorMode};
 
 /// Required quadrature step count for one logical encoder click.
 ///
@@ -86,16 +87,19 @@ where
     ///
     /// - `0` means confidently released
     /// - `button_debounce_tick` means confidently pressed
-    debounce_counter: u8,
+    debounce_counter_millis: u16,
+
+    ///Refresh time of the button reading
+    refresh_time_millis: u16,
 
     /// Current debounced logical button state.
     is_pressed: bool,
 
     /// Number of stable samples required to settle a pressed state.
-    button_debounce_tick: u8,
+    button_debounce_threshold_millis: u16,
 
     /// Number of update ticks required to classify the press as a hold.
-    long_press_threshold_tick: u16,
+    long_press_threshold_millis: u16,
 
     /// High-level press lifecycle state.
     state: ButtonState,
@@ -105,6 +109,8 @@ where
     /// Only one event is stored at a time. If no event is pending,
     /// this field contains [`InputEvent::None`].
     pending_event: InputEvent,
+
+    could_rapid_hold: bool,
 }
 
 impl<SW> Button<SW>
@@ -122,15 +128,23 @@ where
     /// # Notes
     ///
     /// The initial debounced state starts as released.
-    pub fn new(sw_pin: SW, button_debounce_tick: u8, long_press_threshold_tick: u16) -> Self {
+    pub fn new(
+        sw_pin: SW,
+        button_debounce_threshold_millis: u16,
+        long_press_threshold_millis: u16,
+        refresh_time_millis: u16,
+        could_rapid_hold: bool,
+    ) -> Self {
         Self {
             sw_pin,
-            debounce_counter: 0,
+            debounce_counter_millis: 0,
             is_pressed: false,
-            button_debounce_tick,
-            long_press_threshold_tick,
+            button_debounce_threshold_millis,
+            long_press_threshold_millis,
+            refresh_time_millis,
             state: ButtonState::default(),
             pending_event: InputEvent::None,
+            could_rapid_hold,
         }
     }
 
@@ -166,17 +180,17 @@ where
         // The debounced state only changes when the counter reaches one
         // extreme or the other, which suppresses brief glitches.
         if pin_is_low {
-            self.debounce_counter = self
-                .debounce_counter
-                .saturating_add(1)
-                .min(self.button_debounce_tick);
+            self.debounce_counter_millis = self
+                .debounce_counter_millis
+                .saturating_add(self.refresh_time_millis)
+                .min(self.button_debounce_threshold_millis);
         } else {
-            self.debounce_counter = self.debounce_counter.saturating_sub(2);
+            self.debounce_counter_millis = self.debounce_counter_millis.saturating_sub(2);
         }
 
-        if self.debounce_counter >= self.button_debounce_tick {
+        if self.debounce_counter_millis >= self.button_debounce_threshold_millis {
             self.is_pressed = true;
-        } else if self.debounce_counter == 0 {
+        } else if self.debounce_counter_millis == 0 {
             self.is_pressed = false;
         }
 
@@ -203,7 +217,7 @@ where
 
             ButtonState::Counting(ticks) => {
                 if self.is_pressed {
-                    if ticks >= self.long_press_threshold_tick {
+                    if ticks >= self.long_press_threshold_millis {
                         // Generate the hold event exactly once.
                         if self.pending_event == InputEvent::None {
                             self.pending_event = InputEvent::SelectHold;
@@ -244,6 +258,9 @@ where
     /// - [`InputEvent::SelectHold`] for a long press
     /// - [`InputEvent::None`] if no button event is pending
     pub fn poll(&mut self) -> InputEvent {
+        if self.could_rapid_hold && self.pending_event == InputEvent::SelectHold {
+            self.state = ButtonState::Idle;
+        }
         let event = self.pending_event;
         self.pending_event = InputEvent::None;
         event
@@ -352,10 +369,12 @@ where
         mut clk_pin: CLK,
         mut dt_pin: DT,
         sw_pin: SW,
-        button_debounce_tick: u8,
-        long_press_tick: u16,
+        button_debounce_threshold_millis: u16,
+        long_press_threshold_millis: u16,
+        refresh_time_millis: u16,
         rotary_reset_time_ms: u16,
         rotary_multi_step_threshold: u8,
+        could_rapid_hold: bool,
     ) -> Self {
         let clk_low = clk_pin.is_low().unwrap_or(false);
         let dt_low = dt_pin.is_low().unwrap_or(false);
@@ -364,7 +383,13 @@ where
         Self {
             clk_pin,
             dt_pin,
-            button: Button::new(sw_pin, button_debounce_tick, long_press_tick),
+            button: Button::new(
+                sw_pin,
+                button_debounce_threshold_millis,
+                long_press_threshold_millis,
+                refresh_time_millis,
+                could_rapid_hold,
+            ),
             last_quad_state: initial_state,
             encoder_accumulator: 0,
             last_accumulator: RotaryAccumulatorMode::None,
@@ -419,9 +444,7 @@ where
 
         if current != self.last_quad_state {
             let index = ((self.last_quad_state << 2) | current) as usize;
-            self.encoder_accumulator = self
-                .encoder_accumulator
-                .saturating_add(QUAD_TABLE[index]);
+            self.encoder_accumulator = self.encoder_accumulator.saturating_add(QUAD_TABLE[index]);
             self.last_quad_state = current;
         }
     }
