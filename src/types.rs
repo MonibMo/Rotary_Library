@@ -35,13 +35,6 @@ pub trait InputSource {
     fn poll(&mut self) -> InputEvent;
 }
 
-#[derive(Clone, Copy, Default)]
-pub enum ButtonDefaultState{
-    #[default]
-    PulledUp,
-    PulledDown,
-}
-
 /// States of the button press lifecycle.
 ///
 /// The machine advances strictly forward per press cycle:

@@ -35,8 +35,10 @@ pub enum HoldAction {
 // ─── Marker structs ───────────────────────────────────────────────────────────
 
 pub struct RotaryButton;
-pub struct HoodButton;
+pub struct HoodButton1;
 pub struct PushButton;
+
+pub struct HoodButton2;
 
 impl ButtonBehaviour for RotaryButton {
     fn on_hold(_: u16) -> HoldAction {
@@ -50,7 +52,7 @@ impl ButtonBehaviour for RotaryButton {
     }
 }
 
-impl ButtonBehaviour for HoodButton {
+impl ButtonBehaviour for HoodButton1 {
     fn on_hold(_: u16) -> HoldAction {
         HoldAction::EmitAndReset
     }
@@ -62,6 +64,20 @@ impl ButtonBehaviour for HoodButton {
         (t / 3).max(1)
     }
 }
+
+impl ButtonBehaviour for HoodButton2 {
+    fn on_hold(_: u16) -> HoldAction {
+        HoldAction::EmitAndReset
+    }
+    fn emit_select_on_release(hold_emitted: bool) -> bool {
+        !hold_emitted
+    }
+    /// Repeats fire at 1/3 of the initial hold threshold → faster feel.
+    fn repeat_threshold_millis(t: u16) -> u16 {
+        (t / 5).max(1)
+    }
+}
+
 
 impl ButtonBehaviour for PushButton {
     fn on_hold(_: u16) -> HoldAction {
@@ -77,10 +93,10 @@ impl ButtonBehaviour for PushButton {
 
 // ─── Button ───────────────────────────────────────────────────────────────────
 
-pub struct Button<SW, B>
+pub struct Button<SW, BB>
 where
     SW: InputPin,
-    B: ButtonBehaviour,
+    BB: ButtonBehaviour,
 {
     /// Physical switch pin, active-low.
     sw_pin: SW,
@@ -119,13 +135,13 @@ where
     /// How many hold events have fired this press.
     /// 0 → use long_press_threshold; ≥1 → use repeat_threshold.
     hold_repeat_count: u16,
-    _behaviour: PhantomData<B>,
+    _behaviour: PhantomData<BB>,
 }
 
-impl<SW, B> Button<SW, B>
+impl<SW, BB> Button<SW, BB>
 where
     SW: InputPin,
-    B: ButtonBehaviour,
+    BB: ButtonBehaviour,
 {
     pub fn new(
         sw_pin: SW,
@@ -183,7 +199,7 @@ where
                     let threshold = if self.hold_repeat_count == 0 {
                         self.long_press_threshold_millis
                     } else {
-                        B::repeat_threshold_millis(self.long_press_threshold_millis)
+                        BB::repeat_threshold_millis(self.long_press_threshold_millis)
                     };
 
                     if ticks >= threshold {
@@ -191,7 +207,7 @@ where
                             self.pending_event = InputEvent::SelectHold;
                         }
                         // Compile-time dispatch — dead branch eliminated by compiler.
-                        match B::on_hold(self.hold_repeat_count) {
+                        match BB::on_hold(self.hold_repeat_count) {
                             HoldAction::EmitAndWaitRelease => {
                                 self.hold_consumed = true;
                                 self.hold_repeat_count += 1;
@@ -208,7 +224,7 @@ where
                     }
                 } else {
                     // Released before hold threshold → short press.
-                    if B::emit_select_on_release(self.hold_consumed) {
+                    if BB::emit_select_on_release(self.hold_consumed) {
                         if self.pending_event == InputEvent::None {
                             self.pending_event = InputEvent::Select;
                         }
@@ -227,7 +243,7 @@ where
                     // RotaryButton/PushButton: emit_select_on_release returns true
                     //   even when hold_consumed = true → emits Select.
                     // HoodButton: returns !hold_consumed = false → suppressed.
-                    if B::emit_select_on_release(self.hold_consumed) {
+                    if BB::emit_select_on_release(self.hold_consumed) {
                         if self.pending_event == InputEvent::None {
                             self.pending_event = InputEvent::Select;
                         }
