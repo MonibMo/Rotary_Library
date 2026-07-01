@@ -11,7 +11,8 @@ const STEPS_PER_CLICK: i8 = 4;
 
 // ─── ButtonBehaviour trait ────────────────────────────────────────────────────
 
-pub trait ButtonBehaviour {
+pub trait ButtonBehaviour: PartialEq {
+    fn emit_select_on_hold() -> bool;
     /// Called when the hold threshold is crossed.
     /// `repeat_count` = how many holds have already fired this press (0 = first).
     fn on_hold(repeat_count: u16) -> HoldAction;
@@ -34,13 +35,21 @@ pub enum HoldAction {
 
 // ─── Marker structs ───────────────────────────────────────────────────────────
 
+#[derive(PartialEq)]
 pub struct RotaryButton;
+#[derive(PartialEq)]
 pub struct HoodButton1;
+#[derive(PartialEq)]
 pub struct PushButton;
 
+#[derive(PartialEq)]
 pub struct HoodButton2;
 
 impl ButtonBehaviour for RotaryButton {
+    fn emit_select_on_hold() -> bool {
+        false
+    }
+
     fn on_hold(_: u16) -> HoldAction {
         HoldAction::EmitAndWaitRelease
     }
@@ -53,6 +62,9 @@ impl ButtonBehaviour for RotaryButton {
 }
 
 impl ButtonBehaviour for HoodButton1 {
+    fn emit_select_on_hold() -> bool {
+        false
+    }
     fn on_hold(_: u16) -> HoldAction {
         HoldAction::EmitAndReset
     }
@@ -66,20 +78,25 @@ impl ButtonBehaviour for HoodButton1 {
 }
 
 impl ButtonBehaviour for HoodButton2 {
+    fn emit_select_on_hold() -> bool {
+        true
+    }
     fn on_hold(_: u16) -> HoldAction {
         HoldAction::EmitAndReset
     }
     fn emit_select_on_release(hold_emitted: bool) -> bool {
         !hold_emitted
     }
-    /// Repeats fire at 1/3 of the initial hold threshold → faster feel.
+    /// Repeats fire at 1/5 of the initial hold threshold → faster feel.
     fn repeat_threshold_millis(t: u16) -> u16 {
         (t / 5).max(1)
     }
 }
 
-
 impl ButtonBehaviour for PushButton {
+    fn emit_select_on_hold() -> bool {
+        false
+    }
     fn on_hold(_: u16) -> HoldAction {
         HoldAction::EmitAndWaitRelease
     }
@@ -174,7 +191,9 @@ where
                 .saturating_add(self.refresh_time_millis)
                 .min(self.button_debounce_threshold_millis);
         } else {
-            self.debounce_counter_millis = self.debounce_counter_millis.saturating_sub(self.refresh_time_millis / 2);
+            self.debounce_counter_millis = self
+                .debounce_counter_millis
+                .saturating_sub(self.refresh_time_millis / 2);
         }
 
         if self.debounce_counter_millis >= self.button_debounce_threshold_millis {
@@ -192,8 +211,10 @@ where
                     ButtonState::Idle
                 }
             }
-
             ButtonState::Counting(ticks) => {
+                if ticks == 0 && BB::emit_select_on_hold() && !self.hold_consumed {
+                    self.pending_event = InputEvent::Select;
+                }
                 if self.is_pressed {
                     // After first hold, switch to the shorter repeat threshold.
                     let threshold = if self.hold_repeat_count == 0 {
@@ -224,7 +245,7 @@ where
                     }
                 } else {
                     // Released before hold threshold → short press.
-                    if BB::emit_select_on_release(self.hold_consumed) {
+                    if BB::emit_select_on_release(self.hold_consumed) && !BB::emit_select_on_hold() {
                         if self.pending_event == InputEvent::None {
                             self.pending_event = InputEvent::Select;
                         }
