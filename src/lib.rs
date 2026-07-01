@@ -181,6 +181,7 @@ where
         }
     }
 
+    #[cfg(feature = "mode1")]
     pub fn update(&mut self) {
         let pin_is_low = self.sw_pin.is_low().unwrap_or(false);
 
@@ -245,7 +246,8 @@ where
                     }
                 } else {
                     // Released before hold threshold → short press.
-                    if BB::emit_select_on_release(self.hold_consumed) && !BB::emit_select_on_hold() {
+                    if BB::emit_select_on_release(self.hold_consumed) && !BB::emit_select_on_hold()
+                    {
                         if self.pending_event == InputEvent::None {
                             self.pending_event = InputEvent::Select;
                         }
@@ -276,6 +278,7 @@ where
             }
         };
     }
+    #[cfg(feature = "mode2")]
 
     pub fn poll(&mut self) -> InputEvent {
         let event = self.pending_event;
