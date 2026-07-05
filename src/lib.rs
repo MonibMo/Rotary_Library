@@ -278,7 +278,100 @@ where
             }
         };
     }
-    #[cfg(feature = "mode2")]
+
+    #[cfg(not(feature = "mode1"))]
+    pub fn update(&mut self) {
+        let pin_is_low = self.sw_pin.is_low().unwrap_or(false);
+
+        // ── Debounce integrator ───────────────────────────────────────────────
+        if pin_is_low {
+            self.debounce_counter_millis = self
+                .debounce_counter_millis
+                .saturating_add(self.refresh_time_millis)
+                .min(self.button_debounce_threshold_millis);
+        } else {
+            self.debounce_counter_millis = self.debounce_counter_millis.saturating_sub(self.refresh_time_millis / 2);
+        }
+
+        if self.debounce_counter_millis >= self.button_debounce_threshold_millis {
+            self.is_pressed = true;
+        } else if self.debounce_counter_millis == 0 {
+            self.is_pressed = false;
+        }
+
+        // ── State machine ─────────────────────────────────────────────────────
+        self.state = match self.state {
+            ButtonState::Idle => {
+                if self.is_pressed {
+                    ButtonState::Counting(0)
+                } else {
+                    ButtonState::Idle
+                }
+            }
+
+            ButtonState::Counting(ticks) => {
+                if self.is_pressed {
+                    // After first hold, switch to the shorter repeat threshold.
+                    let threshold = if self.hold_repeat_count == 0 {
+                        self.long_press_threshold_millis
+                    } else {
+                        BB::repeat_threshold_millis(self.long_press_threshold_millis)
+                    };
+
+                    if ticks >= threshold {
+                        if self.pending_event == InputEvent::None {
+                            self.pending_event = InputEvent::SelectHold;
+                        }
+                        // Compile-time dispatch — dead branch eliminated by compiler.
+                        match BB::on_hold(self.hold_repeat_count) {
+                            HoldAction::EmitAndWaitRelease => {
+                                self.hold_consumed = true;
+                                self.hold_repeat_count += 1;
+                                ButtonState::WaitingRelease
+                            }
+                            HoldAction::EmitAndReset => {
+                                self.hold_consumed = true;
+                                self.hold_repeat_count += 1;
+                                ButtonState::Counting(0) // reset for next repeat
+                            }
+                        }
+                    } else {
+                        ButtonState::Counting(ticks.saturating_add(1))
+                    }
+                } else {
+                    // Released before hold threshold → short press.
+                    if BB::emit_select_on_release(self.hold_consumed) {
+                        if self.pending_event == InputEvent::None {
+                            self.pending_event = InputEvent::Select;
+                        }
+                    }
+                    self.hold_consumed = false;
+                    self.hold_repeat_count = 0;
+                    ButtonState::Idle
+                }
+            }
+
+            ButtonState::WaitingRelease => {
+                if self.is_pressed {
+                    ButtonState::WaitingRelease
+                } else {
+                    // Release after single hold.
+                    // RotaryButton/PushButton: emit_select_on_release returns true
+                    //   even when hold_consumed = true → emits Select.
+                    // HoodButton: returns !hold_consumed = false → suppressed.
+                    if BB::emit_select_on_release(self.hold_consumed) {
+                        if self.pending_event == InputEvent::None {
+                            self.pending_event = InputEvent::Select;
+                        }
+                    }
+                    self.hold_consumed = false;
+                    self.hold_repeat_count = 0;
+                    ButtonState::Idle
+                }
+            }
+        };
+    }
+
 
     pub fn poll(&mut self) -> InputEvent {
         let event = self.pending_event;
